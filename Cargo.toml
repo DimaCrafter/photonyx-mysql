@@ -1,0 +1,12 @@
+[package]
+name = "photonyx-mysql"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+mysql = "26.0.0"
+json = "0.12.4"
+bindings = { path = "../photonyx/bindings" }
