@@ -1,6 +1,8 @@
 use std::{ffi::c_void, ptr::null};
-use bindings::{c::Slice, db::{EntityHandle, ModelField, ModelFieldType, ModelMetaImpl}};
-use mysql::{prelude::FromValue, Row};
+use bindings::{c::Slice, camel_to_kebab, db::{EntityHandle, ModelField, ModelFieldType, ModelMetaImpl, ModelFieldConstraint}};
+use mysql::{prelude::{FromValue, Queryable}, Row};
+
+use crate::{connection::MySqlConnection, query::{build_describe_query, SqlPart, SqlQuery}, schema::{KeyLinkRecord, Schema, SchemaField}};
 
 
 pub fn fill_model_entity (model: &Box<dyn ModelMetaImpl>, mut row: Row, entity: EntityHandle) -> Result<(), String> {
@@ -42,7 +44,7 @@ pub fn fill_model_entity (model: &Box<dyn ModelMetaImpl>, mut row: Row, entity: 
 	return Ok(());
 }
 
-fn eject_value<T: FromValue> (row: &mut Row, key: &str) -> Result<T, String> {
+pub fn eject_value<T: FromValue> (row: &mut Row, key: &str) -> Result<T, String> {
 	match row.take_opt(key) {
 		Some(result) => match result {
 			Ok(value) => Ok(value),
@@ -68,4 +70,123 @@ fn move_slice_to_field (row: &mut Row, entity: EntityHandle, field: &ModelField)
 	(field.setter)(entity, &slice as *const Slice<u8> as *const c_void);
 
 	return Ok(());
+}
+
+pub fn get_table_name (collection: &str) -> String {
+	let mut table_name = camel_to_kebab(collection);
+	if table_name.ends_with('s') {
+		table_name.push_str("es");
+	} else {
+		table_name.push_str("s");
+	}
+
+	return table_name;
+}
+
+pub fn auto_migrate (db: &mut MySqlConnection, model: &Box<dyn ModelMetaImpl>) -> Result<(), String> {
+	let table_name = get_table_name(model.get_name());
+	let mut conn = db.get_conn()?;
+
+	let schema = match Schema::fetch_for(&mut conn, &table_name)? {
+		Some(schema) => schema,
+		None => {
+			for field in model.get_fields() {
+				match field.meta.type_id {
+					ModelFieldType::Enum => {
+						println!("{}: enum (u{})", field.name, field.meta.length * 8);
+						for i in 0..field.meta.enum_size {
+							let ptr = unsafe { field.meta.enum_values.offset(i as isize) };
+							let name = unsafe { c_string(*ptr) };
+							println!("- {name}");
+						}
+					}
+					ModelFieldType::U8 => {
+						println!("{}: u8", &field.name);
+					},
+					ModelFieldType::I8 => {
+						println!("{}: i8", &field.name);
+					},
+					ModelFieldType::U16 => {
+						println!("{}: u16", &field.name);
+					},
+					ModelFieldType::I16 => {
+						println!("{}: i16", &field.name);
+					},
+					ModelFieldType::F32 => {
+						println!("{}: f32", &field.name);
+					},
+					ModelFieldType::U32 => {
+						println!("{}: u32", &field.name);
+					},
+					ModelFieldType::I32 => {
+						println!("{}: i32", &field.name);
+					},
+					ModelFieldType::F64 => {
+						println!("{}: f64", &field.name);
+					},
+					ModelFieldType::U64 => {
+						println!("{}: u64", &field.name);
+					},
+					ModelFieldType::I64 => {
+						println!("{}: i64", &field.name);
+					},
+					ModelFieldType::Bool => {
+						println!("{}: bool", &field.name);
+					},
+					ModelFieldType::String => {
+						println!("{}: string", &field.name);
+					},
+					ModelFieldType::Array => todo!(),
+					ModelFieldType::Unknown => {
+						println!("{}: unknown", &field.name);
+					}
+				}
+
+				for constraint in &field.meta.constraints {
+					match constraint {
+						ModelFieldConstraint::Length { value } => println!("+ Length({value})"),
+						ModelFieldConstraint::PrimaryKey => println!("+ PrimaryKey"),
+						ModelFieldConstraint::Link { dst_table, dst_column, delete, update } => println!("+ Link to {dst_table}.{dst_column}, {delete:?} on delete, {update:?} on update"),
+					}
+				}
+			}
+
+			for fields in model.get_unique_keys() {
+				println!("* Unique key {:?}", &fields);
+			}
+
+			println!("TODO: create table");
+			return Ok(());
+		}
+	};
+
+	println!("Schema: {:?}", &schema);
+	return Ok(());
+}
+
+// TODO: DRY
+#[allow(non_camel_case_types)]
+pub type c_str = *const std::ffi::c_char;
+
+pub unsafe fn c_string (ptr: c_str) -> String {
+	use std::ptr::slice_from_raw_parts;
+	let raw = &*slice_from_raw_parts(ptr as *const u8, c_strlen(ptr));
+	return String::from_utf8_lossy(raw).into_owned();
+}
+
+pub fn c_strlen (raw: c_str) -> usize {
+	if raw.is_null() {
+        return 0;
+    }
+
+    let mut len = 0;
+    unsafe {
+        let mut ptr = raw;
+        while *ptr != 0 {
+            len += 1;
+            ptr = ptr.add(1);
+        }
+    }
+
+    return len;
 }

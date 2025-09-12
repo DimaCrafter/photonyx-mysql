@@ -12,7 +12,13 @@ pub struct SqlPart {
 
 fn append_name (raw: &mut String, name: &str) {
 	raw.push_str("`");
-	raw.push_str(name);
+	if let Some((a, b)) = name.split_once('.') {
+		raw.push_str(a);
+		raw.push_str("`.`");
+		raw.push_str(b);
+	} else {
+		raw.push_str(name);
+	}
 	raw.push_str("`");
 }
 
@@ -137,6 +143,10 @@ impl SqlPart {
 
 	fn push_value_cmp (&mut self, name: &str, arg: &JsonValue) {
 		match name {
+			"$raw" => {
+				self.append(" = ");
+				self.append(arg.as_str().unwrap());
+			}
 			"$neq" => {
 				if let JsonValue::Null = arg {
 					self.append(" IS NOT NULL");
@@ -266,15 +276,15 @@ impl SqlQuery {
 			filter_part: SqlPart::new()
 		}
 	}
-}
 
-impl QueryBuilder for SqlQuery {
-	fn count (&mut self, query: &JsonValue) {
-		self.select_part.add_raw("COUNT(*)");
-		self.where_part.query(query);
+	pub fn select_by_str (&mut self, projection: &[&str]) {
+		for key in projection {
+			self.select_part.add_key(key);
+		}
 	}
 
-	fn build (mut self: Box<SqlQuery>) -> Box<dyn Any> {
+
+	pub fn build (mut self: SqlQuery) -> SqlPart {
 		let mut result = SqlPart::new();
 
 		if self.select_part.raw.is_empty() {
@@ -293,7 +303,18 @@ impl QueryBuilder for SqlQuery {
 
 		result.append_part(self.filter_part);
 
-		return Box::new(result);
+		return result;
+	}
+}
+
+impl QueryBuilder for SqlQuery {
+	fn count (&mut self, query: &JsonValue) {
+		self.select_part.add_raw("COUNT(*)");
+		self.where_part.query(query);
+	}
+
+	fn build (self: Box<SqlQuery>) -> Box<dyn Any> {
+		return Box::new((*self).build());
 	}
 
 	// SAFETY: caller MUST provide UTF-8 string
@@ -328,4 +349,10 @@ impl QueryBuilder for SqlQuery {
 			println!("-- {:?}", &self.filter_part.params);
 		}
 	}
+}
+
+pub fn build_describe_query (table_name: &str) -> String {
+	let mut query = "DESCRIBE ".to_owned();
+	append_name(&mut query, table_name);
+	return query;
 }
