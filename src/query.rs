@@ -72,6 +72,12 @@ impl SqlPart {
 		if let JsonValue::Object(query_obj) = query {
 			self.push_query(query_obj);
 		} else {
+			if let JsonValue::Array(array) = query {
+				if array.is_empty() {
+					return;
+				}
+			}
+
 			println!("Invalid where: expected object");
 		}
 	}
@@ -324,8 +330,16 @@ impl QueryBuilder for SqlQuery {
 		}
 	}
 
+	fn select_raw (&mut self, stmt: &str) {
+		self.select_part.add_raw(stmt);
+	}
+
 	fn query (&mut self, query: &JsonValue) {
 		self.where_part.query(query);
+	}
+
+	fn limit (&mut self, offset: u32, length: u32) {
+		self.filter_part.limit(offset, length);
 	}
 
 	fn debug (&self) {

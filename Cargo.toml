@@ -9,4 +9,5 @@ crate-type = ["dylib"]
 [dependencies]
 mysql = "26.0.0"
 json = "0.12.4"
+chrono = "0.4.42"
 bindings = { path = "../photonyx/bindings" }

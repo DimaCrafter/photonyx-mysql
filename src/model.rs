@@ -1,51 +1,59 @@
-use std::{ffi::c_void, ptr::null};
-use bindings::{c::Slice, camel_to_kebab, db::{EntityHandle, ModelField, ModelFieldType, ModelMetaImpl, ModelFieldConstraint}};
-use mysql::{prelude::{FromValue, Queryable}, Row};
+use std::{borrow::Cow, ffi::c_void, ptr::null};
+use bindings::{c::{disown, Slice}, camel_to_kebab, db::{EntityHandle, ModelField, ModelFieldType, ModelMetaImpl}};
+use chrono::{DateTime, TimeZone, Utc};
+use mysql::{prelude::FromValue, Row};
 
-use crate::{connection::MySqlConnection, query::{build_describe_query, SqlPart, SqlQuery}, schema::{KeyLinkRecord, Schema, SchemaField}};
+use crate::{connection::MySqlConnection, schema::Schema};
 
 
-pub fn fill_model_entity (model: &Box<dyn ModelMetaImpl>, mut row: Row, entity: EntityHandle) -> Result<(), String> {
-	//? copy to avoid &mut while holding &const
-	let cols: Vec<String> = row.columns_ref().iter().map(|c| c.name_str().into_owned()).collect();
+pub fn fill_model_entity (model: &Box<dyn ModelMetaImpl>, row: Row, entity: EntityHandle) -> Result<(), String> {
+	let cols: Vec<Cow<str>> = row.columns_ref().iter().map(|c| c.name_str()).collect();
 
 	for field in model.get_fields() {
-		if !cols.contains(&field.name) {
+		let mut found = false;
+		for col in &cols {
+			if col == field.name.as_str() {
+				found = true;
+				break;
+			}
+		}
+
+		if !found {
 			(field.setter)(entity, null());
 			continue;
 		}
 
 		match field.meta.type_id {
 			ModelFieldType::Unknown => {},
-			ModelFieldType::U8 => move_value_to_field::<u8>(&mut row, entity, &field)?,
-			ModelFieldType::I8 => move_value_to_field::<i8>(&mut row, entity, &field)?,
-			ModelFieldType::U16 => move_value_to_field::<u16>(&mut row, entity, &field)?,
-			ModelFieldType::I16 => move_value_to_field::<i16>(&mut row, entity, &field)?,
-			ModelFieldType::U32 => move_value_to_field::<u32>(&mut row, entity, &field)?,
-			ModelFieldType::I32 => move_value_to_field::<i32>(&mut row, entity, &field)?,
-			ModelFieldType::F32 => move_value_to_field::<f32>(&mut row, entity, &field)?,
-			ModelFieldType::U64 => move_value_to_field::<u64>(&mut row, entity, &field)?,
-			ModelFieldType::I64 => move_value_to_field::<i64>(&mut row, entity, &field)?,
-			ModelFieldType::F64 => move_value_to_field::<f64>(&mut row, entity, &field)?,
-			ModelFieldType::Bool => move_value_to_field::<bool>(&mut row, entity, &field)?,
-			ModelFieldType::String => move_slice_to_field(&mut row, entity, &field)?,
-			ModelFieldType::Array => move_slice_to_field(&mut row, entity, &field)?,
+			ModelFieldType::U8 => move_value_to_field::<u8>(&row, entity, &field)?,
+			ModelFieldType::I8 => move_value_to_field::<i8>(&row, entity, &field)?,
+			ModelFieldType::U16 => move_value_to_field::<u16>(&row, entity, &field)?,
+			ModelFieldType::I16 => move_value_to_field::<i16>(&row, entity, &field)?,
+			ModelFieldType::U32 => move_value_to_field::<u32>(&row, entity, &field)?,
+			ModelFieldType::I32 => move_value_to_field::<i32>(&row, entity, &field)?,
+			ModelFieldType::F32 => move_value_to_field::<f32>(&row, entity, &field)?,
+			ModelFieldType::U64 => move_value_to_field::<u64>(&row, entity, &field)?,
+			ModelFieldType::I64 => move_value_to_field::<i64>(&row, entity, &field)?,
+			ModelFieldType::F64 => move_value_to_field::<f64>(&row, entity, &field)?,
+			ModelFieldType::Bool => move_value_to_field::<bool>(&row, entity, &field)?,
+			ModelFieldType::String => move_slice_to_field(&row, entity, &field)?,
 			ModelFieldType::Enum => match field.meta.length {
-				1 => move_value_to_field::<u8>(&mut row, entity, &field)?,
-				2 => move_value_to_field::<u16>(&mut row, entity, &field)?,
-				4 => move_value_to_field::<u32>(&mut row, entity, &field)?,
+				1 => move_value_to_field::<u8>(&row, entity, &field)?,
+				2 => move_value_to_field::<u16>(&row, entity, &field)?,
+				4 => move_value_to_field::<u32>(&row, entity, &field)?,
 				length => {
 					return Err(format!("Field '{}' has invalid type enum(u{})", &field.name, length * 8));
 				}
-			}
+			},
+			ModelFieldType::DateTime => parse_value_to_field(&row, parse_datetime, entity, &field)?
 		}
 	}
 
 	return Ok(());
 }
 
-pub fn eject_value<T: FromValue> (row: &mut Row, key: &str) -> Result<T, String> {
-	match row.take_opt(key) {
+pub fn row_get<T: FromValue> (row: &Row, key: &str) -> Result<T, String> {
+	match row.get_opt(key) {
 		Some(result) => match result {
 			Ok(value) => Ok(value),
 			Err(error) => Err(format!("Failed to convert '{key}' value into schema type: {error}"))
@@ -54,14 +62,31 @@ pub fn eject_value<T: FromValue> (row: &mut Row, key: &str) -> Result<T, String>
 	}
 }
 
-fn move_value_to_field<T: FromValue> (row: &mut Row, entity: EntityHandle, field: &ModelField) -> Result<(), String> {
-	let value: T = eject_value(row, &field.name)?;
+fn move_value_to_field<T: FromValue> (row: &Row, entity: EntityHandle, field: &ModelField) -> Result<(), String> {
+	let value: T = row_get(row, &field.name)?;
 	(field.setter)(entity, &value as *const T as *const c_void);
 	return Ok(());
 }
 
-fn move_slice_to_field (row: &mut Row, entity: EntityHandle, field: &ModelField) -> Result<(), String> {
-	let raw: Vec<u8> = eject_value(row, &field.name)?;
+fn parse_value_to_field<R> (row: &Row, parse: fn (mysql::Value) -> Result<R, String>, entity: EntityHandle, field: &ModelField) -> Result<(), String> {
+	let value = parse(row_get(row, &field.name)?)?;
+	(field.setter)(entity, disown(value) as *const c_void);
+	return Ok(());
+}
+
+fn parse_datetime (value: mysql::Value) -> Result<DateTime<Utc>, String> {
+	if let mysql::Value::Date(year, month, day, hour, min, sec, _) = value {
+		let datetime = Utc.with_ymd_and_hms(year as i32, month as u32, day as u32, hour as u32, min as u32, sec as u32);
+		if let chrono::offset::LocalResult::Single(parsed) = datetime {
+			return Ok(parsed);
+		}
+	}
+
+	return Err("invalid timestamp received".to_owned());
+}
+
+fn move_slice_to_field (row: &Row, entity: EntityHandle, field: &ModelField) -> Result<(), String> {
+	let raw: Vec<u8> = row_get(row, &field.name)?;
 	if field.meta.length != 0 && raw.len() > field.meta.length {
 		return Err(format!("Field '{}' has size {} but database returned {}", &field.name, field.meta.length, raw.len()));
 	}
@@ -90,103 +115,17 @@ pub fn auto_migrate (db: &mut MySqlConnection, model: &Box<dyn ModelMetaImpl>) -
 	let schema = match Schema::fetch_for(&mut conn, &table_name)? {
 		Some(schema) => schema,
 		None => {
-			for field in model.get_fields() {
-				match field.meta.type_id {
-					ModelFieldType::Enum => {
-						println!("{}: enum (u{})", field.name, field.meta.length * 8);
-						for i in 0..field.meta.enum_size {
-							let ptr = unsafe { field.meta.enum_values.offset(i as isize) };
-							let name = unsafe { c_string(*ptr) };
-							println!("- {name}");
-						}
-					}
-					ModelFieldType::U8 => {
-						println!("{}: u8", &field.name);
-					},
-					ModelFieldType::I8 => {
-						println!("{}: i8", &field.name);
-					},
-					ModelFieldType::U16 => {
-						println!("{}: u16", &field.name);
-					},
-					ModelFieldType::I16 => {
-						println!("{}: i16", &field.name);
-					},
-					ModelFieldType::F32 => {
-						println!("{}: f32", &field.name);
-					},
-					ModelFieldType::U32 => {
-						println!("{}: u32", &field.name);
-					},
-					ModelFieldType::I32 => {
-						println!("{}: i32", &field.name);
-					},
-					ModelFieldType::F64 => {
-						println!("{}: f64", &field.name);
-					},
-					ModelFieldType::U64 => {
-						println!("{}: u64", &field.name);
-					},
-					ModelFieldType::I64 => {
-						println!("{}: i64", &field.name);
-					},
-					ModelFieldType::Bool => {
-						println!("{}: bool", &field.name);
-					},
-					ModelFieldType::String => {
-						println!("{}: string", &field.name);
-					},
-					ModelFieldType::Array => todo!(),
-					ModelFieldType::Unknown => {
-						println!("{}: unknown", &field.name);
-					}
-				}
-
-				for constraint in &field.meta.constraints {
-					match constraint {
-						ModelFieldConstraint::Length { value } => println!("+ Length({value})"),
-						ModelFieldConstraint::PrimaryKey => println!("+ PrimaryKey"),
-						ModelFieldConstraint::Link { dst_table, dst_column, delete, update } => println!("+ Link to {dst_table}.{dst_column}, {delete:?} on delete, {update:?} on update"),
-					}
-				}
-			}
+			let schema = Schema::from_model(model)?;
+			// println!("Create schema: {:#?}", &schema);
 
 			for fields in model.get_unique_keys() {
 				println!("* Unique key {:?}", &fields);
 			}
 
-			println!("TODO: create table");
 			return Ok(());
 		}
 	};
 
-	println!("Schema: {:?}", &schema);
+	println!("Schema: {:#?}", &schema);
 	return Ok(());
-}
-
-// TODO: DRY
-#[allow(non_camel_case_types)]
-pub type c_str = *const std::ffi::c_char;
-
-pub unsafe fn c_string (ptr: c_str) -> String {
-	use std::ptr::slice_from_raw_parts;
-	let raw = &*slice_from_raw_parts(ptr as *const u8, c_strlen(ptr));
-	return String::from_utf8_lossy(raw).into_owned();
-}
-
-pub fn c_strlen (raw: c_str) -> usize {
-	if raw.is_null() {
-        return 0;
-    }
-
-    let mut len = 0;
-    unsafe {
-        let mut ptr = raw;
-        while *ptr != 0 {
-            len += 1;
-            ptr = ptr.add(1);
-        }
-    }
-
-    return len;
 }

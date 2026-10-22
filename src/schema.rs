@@ -1,6 +1,6 @@
-use bindings::db::QueryBuilder;
+use bindings::db::{ModelField, ModelFieldConstraint, ModelFieldType, ModelMetaImpl, QueryBuilder};
 use mysql::{prelude::Queryable, PooledConn, Row};
-use crate::{model::eject_value, query::{build_describe_query, SqlPart, SqlQuery}};
+use crate::{model::row_get, query::{build_describe_query, SqlPart, SqlQuery}};
 
 
 #[derive(Debug)]
@@ -42,6 +42,21 @@ impl Schema {
 
 		return Ok(Some(Schema { fields }));
 	}
+
+	pub fn from_model (model: &Box<dyn ModelMetaImpl>) -> Result<Self, String> {
+		let mut schema_fields = Vec::new();
+		for field in model.get_fields() {
+			match SchemaField::from_model(field) {
+				Ok(parsed) => schema_fields.push(parsed),
+				Err(error) => {
+					return Err(format!("{}: {}", &field.name, error));
+				}
+			}
+		}
+
+		// todo! add unique keys
+		return Ok(Schema { fields: schema_fields });
+	}
 }
 
 #[derive(Debug)]
@@ -60,9 +75,9 @@ pub struct KeyLinkRecord {
 impl KeyLinkRecord {
 	pub fn from_row (mut row: Row) -> Result<Self, String> {
 		Ok(KeyLinkRecord {
-			src_column: eject_value(&mut row, "COLUMN_NAME")?,
-			dst_table: eject_value(&mut row, "REFERENCED_TABLE_NAME")?,
-			dst_column: eject_value(&mut row, "REFERENCED_COLUMN_NAME")?,
+			src_column: row_get(&mut row, "COLUMN_NAME")?,
+			dst_table: row_get(&mut row, "REFERENCED_TABLE_NAME")?,
+			dst_column: row_get(&mut row, "REFERENCED_COLUMN_NAME")?,
 		})
 	}
 
@@ -111,12 +126,12 @@ pub struct SchemaField {
 
 impl SchemaField {
 	pub fn from_row (mut row: Row, links: &mut Vec<KeyLinkRecord>) -> Result<Self, String> {
-		let name: String = eject_value(&mut row, "Field")?;
-		let type_descriptor: String = eject_value(&mut row, "Type")?;
-		let key: String = eject_value(&mut row, "Key")?;
-		let nullable_raw: String = eject_value(&mut row, "Null")?;
-		let extra_raw: String = eject_value(&mut row, "Extra")?;
-		let default: Option<String> = eject_value(&mut row, "Default")?;
+		let name: String = row_get(&mut row, "Field")?;
+		let type_descriptor: String = row_get(&mut row, "Type")?;
+		let key: String = row_get(&mut row, "Key")?;
+		let nullable_raw: String = row_get(&mut row, "Null")?;
+		let extra_raw: String = row_get(&mut row, "Extra")?;
+		let default: Option<String> = row_get(&mut row, "Default")?;
 
 		let extra: Vec<&str> = extra_raw.split(' ').collect();
 
@@ -148,6 +163,158 @@ impl SchemaField {
 			name,
 			nullable: nullable_raw == "YES",
 			default
+		});
+	}
+
+	pub fn from_model (field: &ModelField) -> Result<Self, String> {
+		let mut type_decl = String::new();
+		let mut type_attributes = String::new();
+
+		match field.meta.type_id {
+			ModelFieldType::DateTime => {
+				type_decl.push_str("datetime");
+			},
+			ModelFieldType::Enum => {
+				type_decl.push_str("enum(");
+
+				let mut is_first = true;
+				for name in field.meta.iter_enum() {
+					if is_first {
+						is_first = false;
+					} else {
+						type_decl.push(',');
+					}
+
+					type_decl.push('"');
+					type_decl.push_str(name.as_str());
+					type_decl.push('"');
+				}
+
+				type_decl.push_str(")");
+			}
+			ModelFieldType::U8 => {
+				if field.meta.length != 0 {
+					type_decl.push_str("char(");
+					type_decl.push_str(&field.meta.length.to_string());
+					type_decl.push_str(")");
+				} else {
+					type_decl.push_str("tinyint");
+					type_attributes.push_str(" unsigned");
+				}
+			},
+			ModelFieldType::I8 => {
+				if field.meta.length != 0 {
+					return Err(format!("i8 array in unsupported"));
+				}
+
+				type_decl.push_str("tinyint");
+			},
+			ModelFieldType::U16 => {
+				if field.meta.length != 0 {
+					return Err(format!("u16 array in unsupported"));
+				}
+
+				type_decl.push_str("smallint");
+				type_attributes.push_str(" unsigned");
+			},
+			ModelFieldType::I16 => {
+				if field.meta.length != 0 {
+					return Err(format!("i16 array in unsupported"));
+				}
+
+				type_decl.push_str("smallint");
+			},
+			ModelFieldType::F32 => {
+				if field.meta.length != 0 {
+					return Err(format!("f32 array in unsupported"));
+				}
+
+				type_decl.push_str("float");
+			},
+			ModelFieldType::U32 => {
+				if field.meta.length != 0 {
+					return Err(format!("u32 array in unsupported"));
+				}
+
+				type_decl.push_str("int");
+				type_attributes.push_str(" unsigned");
+			},
+			ModelFieldType::I32 => {
+				if field.meta.length != 0 {
+					return Err(format!("i32 array in unsupported"));
+				}
+
+				type_decl.push_str("int");
+			},
+			ModelFieldType::F64 => {
+				if field.meta.length != 0 {
+					return Err(format!("f64 array in unsupported"));
+				}
+
+				type_decl.push_str("double");
+			},
+			ModelFieldType::U64 => {
+				if field.meta.length != 0 {
+					return Err(format!("u64 array in unsupported"));
+				}
+
+				type_decl.push_str("bigint");
+				type_attributes.push_str(" unsigned");
+			},
+			ModelFieldType::I64 => {
+				if field.meta.length != 0 {
+					return Err(format!("i64 array in unsupported"));
+				}
+
+				type_decl.push_str("bigint");
+			},
+			ModelFieldType::Bool => {
+				type_decl.push_str("tinyint(1)");
+			},
+			ModelFieldType::String => {
+				type_decl.push_str("varchar");
+			},
+			ModelFieldType::Unknown => {
+				return Err("unknown type field".to_owned());
+			}
+		};
+
+		let mut key = SchemaKey::None;
+		for constraint in &field.meta.constraints {
+			match constraint {
+				ModelFieldConstraint::Length { value } => {
+					if type_decl.ends_with(')') {
+						return Err("unexpected length constraint".to_owned());
+					}
+
+					type_decl.push('(');
+					type_decl.push_str(&value.to_string());
+					type_decl.push(')');
+				}
+				ModelFieldConstraint::PrimaryKey => {
+					key = SchemaKey::Primary { auto_increment: true };
+				}
+				ModelFieldConstraint::Link { dst_table, dst_column, delete: _, update: _ } => {
+					key = SchemaKey::Link { table: dst_table.clone(), column: dst_column.clone() };
+					// todo! add {delete:?} on delete, {update:?} on update
+				}
+			}
+		}
+
+		// Only **unsized** `varchar` means `text`
+		if type_decl == "varchar" {
+			type_decl.clear();
+			type_decl.push_str("text");
+		}
+
+		type_decl.push_str(&type_attributes);
+
+		return Ok(SchemaField {
+			name: field.name.clone(),
+			type_descriptor: type_decl,
+			key,
+			nullable: field.meta.optional,
+			default: None // todo! create default value literal
 		});
 	}
 }

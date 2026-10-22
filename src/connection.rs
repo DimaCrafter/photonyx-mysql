@@ -1,7 +1,8 @@
 use std::any::Any;
 use bindings::{db::{DatabaseConnection, DatabaseImpl, EntityHandle, EntityList, ModelMetaImpl, QueryBuilder}, validator_json};
+use chrono::{TimeZone, Utc};
 use json::JsonValue;
-use mysql::{prelude::Queryable, OptsBuilder, Pool, Row};
+use mysql::{OptsBuilder, Pool, Row, Value, prelude::Queryable};
 
 use crate::{model::{auto_migrate, fill_model_entity, get_table_name}, query::{SqlPart, SqlQuery}};
 
@@ -66,6 +67,55 @@ impl DatabaseConnection for MySqlConnection {
 
     fn new_query (&self, collection: &str) -> Box<dyn QueryBuilder> {
         return Box::new(SqlQuery::new(&get_table_name(collection)));
+    }
+
+    fn exec_value (&mut self, query_any: Box<dyn Any>) -> Result<Option<Box<dyn Any>>, String> {
+        let mut conn = self.get_conn()?;
+
+        let query_box = match query_any.downcast::<SqlPart>() {
+            Ok(value) => value,
+            Err(_) => return Err("Invalid query type passed".to_owned())
+        };
+
+        let result: Option<Row> = match conn.exec_first(&query_box.raw, query_box.params) {
+            Ok(value) => value,
+            Err(error) => {
+                println!("DEBUG: {}", &query_box.raw);
+                return Err(error.to_string());
+            }
+        };
+
+        if let Some(mut row) = result {
+            if let Some(value) = row.take::<Value, usize>(0) {
+                return Ok(match value {
+                    Value::NULL => None,
+                    Value::Bytes(items) => Some(Box::new(items)),
+                    Value::Int(number) => {
+                        let b = Box::new(number) as Box<dyn std::any::Any>;
+                        let b1 = b.downcast_ref::<i64>().unwrap();
+                        println!("b = {:?}, b1 = {}", &b, b1);
+                        Some(b)
+                    },
+                    Value::UInt(number) => {
+                        let b = Box::new(number);
+                        Some(b)
+                    },
+                    Value::Float(number) => Some(Box::new(number)),
+                    Value::Double(number) => Some(Box::new(number)),
+                    Value::Date(year, month, day, hour, min, sec, _) => {
+                        let datetime = Utc.with_ymd_and_hms(year as i32, month as u32, day as u32, hour as u32, min as u32, sec as u32);
+                        if let chrono::offset::LocalResult::Single(parsed) = datetime {
+                            Some(Box::new(parsed))
+                        } else {
+                            None
+                        }
+                    },
+                    Value::Time(_, _, _, _, _, _) => None
+                });
+            }
+        }
+
+        return Ok(None);
     }
 
     fn exec_first (&mut self, model: &Box<dyn ModelMetaImpl>, query_any: Box<dyn Any>) -> Result<Option<EntityHandle>, String> {
