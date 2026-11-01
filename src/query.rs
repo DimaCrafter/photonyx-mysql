@@ -5,6 +5,7 @@ use json::{object::Object, Array, JsonValue};
 use mysql::Value;
 
 // todo: better SqlPart error tracing (like invalid op. or unsupported type)
+#[derive(Clone)]
 pub struct SqlPart {
 	pub raw: String,
 	pub params: Vec<Value>
@@ -174,6 +175,14 @@ impl SqlPart {
 				self.append(" < ");
 				self.append_value(arg);
 			}
+			"$gte" => {
+				self.append(" >= ");
+				self.append_value(arg);
+			}
+			"$lte" => {
+				self.append(" <= ");
+				self.append_value(arg);
+			}
 			"$startsWith" => {
 				self.append(" LIKE ");
 				let like_arg = format!("{}%", arg.as_str().unwrap_or("").replace('%', "\\%"));
@@ -244,11 +253,6 @@ impl SqlSelect {
 		}
 	}
 
-	pub fn add_all (&mut self) {
-		self.append_sep();
-		self.raw.push_str("*");
-	}
-
 	pub fn add_key<S: AsRef<str>> (&mut self, key: S) {
 		self.append_sep();
 		append_name(&mut self.raw, key.as_ref());
@@ -283,31 +287,26 @@ impl SqlQuery {
 		}
 	}
 
-	pub fn select_by_str (&mut self, projection: &[&str]) {
-		for key in projection {
-			self.select_part.add_key(key);
-		}
-	}
 
-
-	pub fn build (mut self: SqlQuery) -> SqlPart {
+	pub fn build (&self) -> SqlPart {
 		let mut result = SqlPart::new();
 
+		result.append("SELECT ");
 		if self.select_part.raw.is_empty() {
-			self.select_part.add_all();
+			result.append("*");
+		} else {
+			result.append(&self.select_part.raw);
 		}
 
-		result.append("SELECT ");
-		result.append(self.select_part.raw);
 		result.append(" FROM ");
 		append_name(&mut result.raw, &self.table);
 
 		if !self.where_part.raw.is_empty() {
 			result.append(" WHERE ");
-			result.append_part(self.where_part);
+			result.append_part(self.where_part.clone());
 		}
 
-		result.append_part(self.filter_part);
+		result.append_part(self.filter_part.clone());
 
 		return result;
 	}
@@ -319,8 +318,8 @@ impl QueryBuilder for SqlQuery {
 		self.where_part.query(query);
 	}
 
-	fn build (self: Box<SqlQuery>) -> Box<dyn Any> {
-		return Box::new((*self).build());
+	fn build (&self) -> Box<dyn Any> {
+		return Box::new(SqlQuery::build(self));
 	}
 
 	// SAFETY: caller MUST provide UTF-8 string
@@ -335,7 +334,17 @@ impl QueryBuilder for SqlQuery {
 	}
 
 	fn query (&mut self, query: &JsonValue) {
-		self.where_part.query(query);
+		let mut part = SqlPart::new();
+		part.query(query);
+		if part.raw.is_empty() {
+			return;
+		}
+
+		if !self.where_part.raw.is_empty() {
+			self.where_part.append(" AND ");
+		}
+
+		self.where_part.append_part(part);
 	}
 
 	fn limit (&mut self, offset: u32, length: u32) {
@@ -363,10 +372,4 @@ impl QueryBuilder for SqlQuery {
 			println!("-- {:?}", &self.filter_part.params);
 		}
 	}
-}
-
-pub fn build_describe_query (table_name: &str) -> String {
-	let mut query = "DESCRIBE ".to_owned();
-	append_name(&mut query, table_name);
-	return query;
 }

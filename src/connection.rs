@@ -1,10 +1,10 @@
 use std::any::Any;
-use bindings::{db::{DatabaseConnection, DatabaseImpl, EntityHandle, EntityList, ModelMetaImpl, QueryBuilder}, validator_json};
+use bindings::{db::{DatabaseConnection, DatabaseImpl, EntityHandle, EntityList, ModelMeta, ModelsCheck, QueryBuilder}, validator_json};
 use chrono::{TimeZone, Utc};
 use json::JsonValue;
 use mysql::{OptsBuilder, Pool, Row, Value, prelude::Queryable};
 
-use crate::{model::{auto_migrate, fill_model_entity, get_table_name}, query::{SqlPart, SqlQuery}};
+use crate::{dialect::MySqlDialect, introspect::MySqlSession, model::fill_model_entity, query::{SqlPart, SqlQuery}};
 
 
 validator_json! {
@@ -22,29 +22,45 @@ pub struct MySqlConnection {
 }
 
 impl MySqlConnection {
-    pub fn new (config: ConnectionConfig) -> Result<Self, String> {
-        if config.name.is_empty() {
-            return Err("name: field is required".to_owned());
-        }
-
-        if config.username.is_empty() {
-            return Err("username: field is required".to_owned());
-        }
-
-        let mut opts = OptsBuilder::new()
-            .ip_or_hostname(Some(config.host))
-            .tcp_port(config.port)
-            .db_name(Some(config.name))
-            .user(Some(config.username));
-
-        if !config.password.is_empty() {
-            opts = opts.pass(Some(config.password));
-        }
-
+    pub fn new (opts: OptsBuilder) -> Result<Self, String> {
         return Ok(MySqlConnection {
             pool: Pool::new(opts).map_err(|error| error.to_string())?
         });
     }
+}
+
+pub fn connection_opts (raw_config: &JsonValue) -> Result<OptsBuilder, String> {
+    let mut config = ConnectionConfig {
+        host: "127.0.0.1".to_owned(),
+        port: 3306,
+        name: String::new(),
+        username: String::new(),
+        password: String::new()
+    };
+
+    if let Err(error) = config.assign_json(raw_config) {
+        return Err(format!("Failed to parse config branch {}: {}", error.path.join("."), error.message));
+    }
+
+    if config.name.is_empty() {
+        return Err("name: field is required".to_owned());
+    }
+
+    if config.username.is_empty() {
+        return Err("username: field is required".to_owned());
+    }
+
+    let mut opts = OptsBuilder::new()
+        .ip_or_hostname(Some(config.host))
+        .tcp_port(config.port)
+        .db_name(Some(config.name))
+        .user(Some(config.username));
+
+    if !config.password.is_empty() {
+        opts = opts.pass(Some(config.password));
+    }
+
+    return Ok(opts);
 }
 
 impl MySqlConnection {
@@ -65,8 +81,8 @@ impl DatabaseConnection for MySqlConnection {
 		return self;
 	}
 
-    fn new_query (&self, collection: &str) -> Box<dyn QueryBuilder> {
-        return Box::new(SqlQuery::new(&get_table_name(collection)));
+    fn new_query (&self, table: &str) -> Box<dyn QueryBuilder> {
+        return Box::new(SqlQuery::new(table));
     }
 
     fn exec_value (&mut self, query_any: Box<dyn Any>) -> Result<Option<Box<dyn Any>>, String> {
@@ -90,12 +106,7 @@ impl DatabaseConnection for MySqlConnection {
                 return Ok(match value {
                     Value::NULL => None,
                     Value::Bytes(items) => Some(Box::new(items)),
-                    Value::Int(number) => {
-                        let b = Box::new(number) as Box<dyn std::any::Any>;
-                        let b1 = b.downcast_ref::<i64>().unwrap();
-                        println!("b = {:?}, b1 = {}", &b, b1);
-                        Some(b)
-                    },
+                    Value::Int(number) => Some(Box::new(number)),
                     Value::UInt(number) => {
                         let b = Box::new(number);
                         Some(b)
@@ -118,7 +129,7 @@ impl DatabaseConnection for MySqlConnection {
         return Ok(None);
     }
 
-    fn exec_first (&mut self, model: &Box<dyn ModelMetaImpl>, query_any: Box<dyn Any>) -> Result<Option<EntityHandle>, String> {
+    fn exec_first (&mut self, model: &ModelMeta, query_any: Box<dyn Any>) -> Result<Option<EntityHandle>, String> {
         let mut conn = self.get_conn()?;
 
         let query_box = match query_any.downcast::<SqlPart>() {
@@ -135,15 +146,19 @@ impl DatabaseConnection for MySqlConnection {
         };
 
         if let Some(value) = result {
-            let entity = model.init_entity();
-            fill_model_entity(model, value, entity)?;
+            let entity = model.init_entity()?;
+            if let Err(error) = fill_model_entity(model, value, entity) {
+                model.deinit_entity(entity);
+                return Err(error);
+            }
+
             return Ok(Some(entity));
         }
 
         return Ok(None);
     }
 
-    fn exec_all (&mut self, model: &Box<dyn ModelMetaImpl>, query_any: Box<dyn Any>) -> Result<EntityList, String> {
+    fn exec_all (&mut self, model: &ModelMeta, query_any: Box<dyn Any>) -> Result<EntityList, String> {
         let mut conn = self.get_conn()?;
 
         let query_box = match query_any.downcast::<SqlPart>() {
@@ -163,8 +178,12 @@ impl DatabaseConnection for MySqlConnection {
         for item in iter {
             match item {
                 Ok(value) => {
-                    let entity = model.init_entity();
-                    fill_model_entity(model, value, entity)?;
+                    let entity = model.init_entity()?;
+                    if let Err(error) = fill_model_entity(model, value, entity) {
+                        model.deinit_entity(entity);
+                        return Err(error);
+                    }
+
                     result.push(entity);
                 }
                 Err(error) => {
@@ -176,12 +195,9 @@ impl DatabaseConnection for MySqlConnection {
         return Ok(result);
     }
 
-    fn auto_migrate (&mut self, model: &mut Box<dyn ModelMetaImpl>) {
-        println!("mysql::auto_migrate {}", model.get_name());
-
-        if let Err(error) = auto_migrate(self, model) {
-            println!("Auto-migration failed: {error}");
-        }
+    fn check_models (&self, models: &[(String, String)]) -> Result<Option<ModelsCheck>, String> {
+        let mut session = MySqlSession::new(self.get_conn()?);
+        return photonyx_sql_shared::migrate::check_models(&mut session, &MySqlDialect, models).map(Some);
     }
 }
 
@@ -194,18 +210,6 @@ impl DatabaseImpl for MySqlImpl {
 	}
 
     fn connect (&self, raw_config: &JsonValue) -> Result<Box<dyn DatabaseConnection>, String> {
-        let mut config = ConnectionConfig {
-            host: "127.0.0.1".to_owned(),
-            port: 3306,
-            name: String::new(),
-            username: String::new(),
-            password: String::new()
-        };
-
-        if let Err(error) = config.assign_json(raw_config) {
-            return Err(format!("Failed to parse config branch {}: {}", error.path.join("."), error.message));
-        }
-
-        return Ok(Box::new(MySqlConnection::new(config)?));
+        return Ok(Box::new(MySqlConnection::new(connection_opts(raw_config)?)?));
     }
 }
